@@ -8,3 +8,4 @@ releases/
 
 sm_spacemouse_config.json
 spacemouse_data.json
+.gitignore
