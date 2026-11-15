@@ -1,3 +1,4 @@
-# Space mouse readout
+# Any Controller json readout
 
-Work in progress component for a scrap mechanic mod
+Liest jeden verfügbaren controller aus und schreibt eine json neben dem Programm
+Unterstützt unendlich viele achsen und buttons

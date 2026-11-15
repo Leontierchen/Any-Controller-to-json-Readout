@@ -10,13 +10,12 @@ from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
-    QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
-    QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -26,245 +25,313 @@ try:
 except ImportError:
     hid = None
 
+try:
+    import pygame
+except ImportError:
+    pygame = None
 
-CONFIG_FILE = Path(__file__).parent / "sm_spacemouse_config.json"
 
-# 3Dconnexion Vendor IDs (0x256F = neuere Modelle, 0x046D = ältere Logitech/3Dconnexion Modelle)
-VENDOR_IDS = (0x256F, 0x046D)
+def get_app_dir() -> Path:
+    """Gibt immer den Ordner zurück, in dem die EXE (oder das .py-Skript) liegt."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
-AXES = [
-    ("x", "X (Links / Rechts)"),
-    ("y", "Y (Vor / Zurück)"),
-    ("z", "Z (Hoch / Runter)"),
-    ("pitch", "Pitch (Nicken)"),
-    ("roll", "Roll (Rollen)"),
-    ("yaw", "Yaw (Drehen)"),
-]
+
+APP_DIR = get_app_dir()
+OUTPUT_JSON = APP_DIR / "controller_data.json"
+CONFIG_FILE = APP_DIR / "bridge_config.json"
+
+SPACEMOUSE_VENDORS = (0x256F, 0x046D)
+SPACEMOUSE_AXES = ["x", "y", "z", "pitch", "roll", "yaw"]
 
 
 class BipolarAxisBar(QWidget):
-    """Zeichnet einen zentrierten -1.0 bis +1.0 Balken mit exakter Wertanzeige."""
+    """Kompakter -1.0 bis +1.0 Live-Balken für Achsen."""
 
     def __init__(self, label_text: str, accent_color: str = "#00d2ff"):
         super().__init__()
         self.label_text = label_text
         self.accent_color = QColor(accent_color)
         self.value = 0.0
-        self.setMinimumHeight(46)
+        self.setMinimumHeight(34)
 
     def set_value(self, val: float):
         val = max(-1.0, min(1.0, float(val)))
-        if abs(val - self.value) > 0.001:
+        if abs(val - self.value) > 0.002:
             self.value = val
             self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         w = self.width()
 
-        # Header-Text
-        painter.setPen(QColor("#e0e0e0"))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        painter.drawText(2, 14, self.label_text)
+        painter.setPen(QColor("#dcdcdc"))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        painter.drawText(2, 12, self.label_text)
 
-        val_str = f"{self.value:+.3f}"
-        painter.setPen(self.accent_color if abs(self.value) > 0.001 else QColor("#888888"))
-        painter.drawText(w - 60, 14, val_str)
+        val_str = f"{self.value:+.2f}"
+        painter.setPen(self.accent_color if abs(self.value) > 0.005 else QColor("#777777"))
+        painter.drawText(w - 45, 12, val_str)
 
-        # Track-Hintergrund
-        bar_y = 20
-        bar_h = 18
+        bar_y, bar_h = 16, 12
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#2b2b2b"))
-        painter.drawRoundedRect(0, bar_y, w, bar_h, 6, 6)
+        painter.setBrush(QColor("#262626"))
+        painter.drawRoundedRect(0, bar_y, w, bar_h, 4, 4)
 
-        # Aktiver Balken von der Mitte aus
         center_x = w / 2.0
-        if abs(self.value) > 0.0001:
+        if abs(self.value) > 0.001:
             painter.setBrush(self.accent_color)
             if self.value > 0:
-                bar_w = (w / 2.0) * self.value
-                painter.drawRoundedRect(int(center_x), bar_y, int(bar_w), bar_h, 4, 4)
+                painter.drawRoundedRect(int(center_x), bar_y, int((w / 2.0) * self.value), bar_h, 3, 3)
             else:
-                bar_w = (w / 2.0) * abs(self.value)
-                painter.drawRoundedRect(int(center_x - bar_w), bar_y, int(bar_w), bar_h, 4, 4)
+                bw = (w / 2.0) * abs(self.value)
+                painter.drawRoundedRect(int(center_x - bw), bar_y, int(bw), bar_h, 3, 3)
 
-        # Mittellinie (0.0 Marker)
-        painter.setPen(QPen(QColor("#ffffff"), 2))
-        painter.drawLine(int(center_x), bar_y - 2, int(center_x), bar_y + bar_h + 2)
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.drawLine(int(center_x), bar_y - 1, int(center_x), bar_y + bar_h + 1)
 
 
-class SpaceMouseWorker(QThread):
-    """Liest die SpaceMouse direkt per USB-HID aus und schreibt atomar die JSON-Datei."""
+class ButtonPill(QLabel):
+    """Visueller Indikator für einen digitalen Button (0 oder 1)."""
 
-    data_updated = pyqtSignal(dict)
-    status_changed = pyqtSignal(str, bool)
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedHeight(24)
+        self.setMinimumWidth(46)
+        self.active = None
+        self.set_pressed(False)
 
-    def __init__(self, output_path: str, deadzone: float = 0.03):
+    def set_pressed(self, pressed: bool):
+        if self.active == pressed:
+            return
+        self.active = pressed
+        if pressed:
+            self.setStyleSheet(
+                "background-color: #00d2ff; color: #111111; border-radius: 10px; "
+                "font-weight: bold; font-size: 11px; padding: 2px 6px;"
+            )
+        else:
+            self.setStyleSheet(
+                "background-color: #262626; color: #888888; border-radius: 10px; "
+                "font-size: 11px; padding: 2px 6px;"
+            )
+
+
+class MultiControllerWorker(QThread):
+    """Liest alle SpaceMice (HID) und Gamepads/Joysticks (Pygame) gleichzeitig aus."""
+
+    state_updated = pyqtSignal(dict)
+    status_updated = pyqtSignal(str)
+
+    def __init__(self, deadzone: float = 0.04):
         super().__init__()
-        self.output_path = output_path
         self.deadzone = deadzone
         self.running = True
 
-    def update_settings(self, output_path: str, deadzone: float):
-        self.output_path = output_path
-        self.deadzone = deadzone
-
-    def _apply_deadzone(self, raw_val: int, max_range: float = 350.0) -> float:
-        # 3Dconnexion liefert Werte typischerweise im Bereich -350 bis +350
-        norm = max(-1.0, min(1.0, raw_val / max_range))
-        if abs(norm) < self.deadzone:
+    def _apply_deadzone(self, val: float) -> float:
+        val = max(-1.0, min(1.0, float(val)))
+        if abs(val) < self.deadzone:
             return 0.0
-        sign = 1.0 if norm > 0 else -1.0
-        scaled = (abs(norm) - self.deadzone) / (1.0 - self.deadzone)
+        sign = 1.0 if val > 0 else -1.0
+        scaled = (abs(val) - self.deadzone) / (1.0 - self.deadzone)
         return round(max(-1.0, min(1.0, sign * scaled)), 4)
 
-    def _find_spacemouse_device(self):
-        """Sucht das passende HID-Interface (Multi-Axis Controller: Usage Page 1, Usage 8)."""
-        devices = hid.enumerate()
-        fallback = None
-        for dev in devices:
-            if dev["vendor_id"] in VENDOR_IDS:
-                # Usage Page 1 (Generic Desktop), Usage 8 (Multi-axis Controller)
+    def _scan_spacemice(self) -> list[dict]:
+        found = []
+        if hid is None:
+            return found
+        seen_paths = set()
+        for dev in hid.enumerate():
+            if dev["vendor_id"] in SPACEMOUSE_VENDORS:
                 if dev.get("usage_page") == 1 and dev.get("usage") == 8:
-                    return dev
-                if fallback is None:
-                    fallback = dev
-        return fallback
+                    path = dev["path"]
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        found.append(dev)
+        return found
 
     def run(self):
-        if hid is None:
-            self.status_changed.emit("Fehler: 'hidapi' nicht installiert (pip install hidapi)", False)
-            return
+        if pygame is not None:
+            pygame.init()
+            pygame.joystick.init()
 
-        dev_handle = None
+        sm_handles = {}  # id -> {"handle": hid.device, "name": str, "raw": dict}
+        pg_joysticks = {}  # id -> pygame.joystick.Joystick
+        last_scan = 0.0
         last_write = 0.0
 
-        # Aktueller Zustand aller 6 Achsen + Buttons
-        raw_state = {
-            "x": 0,
-            "y": 0,
-            "z": 0,
-            "pitch": 0,
-            "roll": 0,
-            "yaw": 0,
-            "buttons": [0, 0],
-        }
-
         while self.running:
-            if dev_handle is None:
+            now = time.time()
+
+            # Alle 2 Sekunden nach neu angeschlossenen/getrennten Geräten suchen
+            if now - last_scan >= 2.0:
+                last_scan = now
+
+                # 1. SpaceMice prüfen
+                if hid is not None:
+                    current_sm = self._scan_spacemice()
+                    active_sm_ids = set()
+                    for idx, info in enumerate(current_sm):
+                        cid = f"spacemouse_{idx}"
+                        active_sm_ids.add(cid)
+                        if cid not in sm_handles:
+                            try:
+                                h = hid.device()
+                                h.open_path(info["path"])
+                                h.set_nonblocking(True)
+                                name = info.get("product_string") or f"3Dconnexion SpaceMouse #{idx + 1}"
+                                sm_handles[cid] = {
+                                    "handle": h,
+                                    "name": name,
+                                    "raw": {a: 0.0 for a in SPACEMOUSE_AXES},
+                                    "buttons": {f"btn_{b}": 0 for b in range(1, 9)},
+                                }
+                            except Exception:
+                                pass
+
+                    for cid in list(sm_handles.keys()):
+                        if cid not in active_sm_ids:
+                            try:
+                                sm_handles[cid]["handle"].close()
+                            except Exception:
+                                pass
+                            del sm_handles[cid]
+
+                # 2. Pygame Joysticks / Gamepads prüfen
+                if pygame is not None:
+                    pygame.event.pump()
+                    count = pygame.joystick.get_count()
+                    active_pg_ids = set()
+                    for i in range(count):
+                        try:
+                            joy = pygame.joystick.Joystick(i)
+                            if not joy.get_init():
+                                joy.init()
+                            # SpaceMouse nicht doppelt über DirectInput erfassen, falls Treiber sie als Joystick meldet
+                            jname = joy.get_name()
+                            if "3dconnexion" in jname.lower() or "spacemouse" in jname.lower():
+                                continue
+                            cid = f"joy_{joy.get_instance_id()}"
+                            active_pg_ids.add(cid)
+                            if cid not in pg_joysticks:
+                                pg_joysticks[cid] = joy
+                        except Exception:
+                            pass
+
+                    for cid in list(pg_joysticks.keys()):
+                        if cid not in active_pg_ids:
+                            del pg_joysticks[cid]
+
+            # Daten aller Controller einsammeln
+            controllers_payload = {}
+
+            # SpaceMouse Pakete auslesen
+            for cid, entry in list(sm_handles.items()):
+                h = entry["handle"]
+                raw = entry["raw"]
+                btns = entry["buttons"]
                 try:
-                    info = self._find_spacemouse_device()
-                    if info is None:
-                        self.status_changed.emit("Keine SpaceMouse gefunden – suche...", False)
-                        time.sleep(1.5)
-                        continue
+                    while True:
+                        pkt = h.read(64)
+                        if not pkt:
+                            break
+                        rid = pkt[0]
+                        if rid == 1 and len(pkt) >= 7:
+                            tx, ty, tz = struct.unpack("<hhh", bytes(pkt[1:7]))
+                            raw["x"] = tx / 350.0
+                            raw["y"] = -ty / 350.0
+                            raw["z"] = -tz / 350.0
+                            if len(pkt) >= 13:
+                                rx, ry, rz = struct.unpack("<hhh", bytes(pkt[7:13]))
+                                raw["pitch"] = rx / 350.0
+                                raw["roll"] = ry / 350.0
+                                raw["yaw"] = rz / 350.0
+                        elif rid == 2 and len(pkt) >= 7:
+                            rx, ry, rz = struct.unpack("<hhh", bytes(pkt[1:7]))
+                            raw["pitch"] = rx / 350.0
+                            raw["roll"] = ry / 350.0
+                            raw["yaw"] = rz / 350.0
+                        elif rid == 3 and len(pkt) >= 2:
+                            mask = pkt[1]
+                            for b_idx in range(8):
+                                btns[f"btn_{b_idx + 1}"] = 1 if (mask & (1 << b_idx)) else 0
 
-                    dev_handle = hid.device()
-                    dev_handle.open_path(info["path"])
-                    dev_handle.set_nonblocking(True)
-                    prod_name = info.get("product_string") or "3Dconnexion SpaceMouse"
-                    self.status_changed.emit(f"Verbunden: {prod_name}", True)
-                except Exception as e:
-                    dev_handle = None
-                    self.status_changed.emit(f"Verbindungsfehler: {e}", False)
-                    time.sleep(1.5)
-                    continue
-
-            try:
-                # Alle gepufferten HID-Pakete im aktuellen Zyklus auslesen
-                updated = False
-                while True:
-                    packet = dev_handle.read(64)
-                    if not packet:
-                        break
-                    updated = True
-                    report_id = packet[0]
-
-                    # Report 1: Translation (X, Y, Z) als 3x signed 16-bit int (Little Endian)
-                    if report_id == 1 and len(packet) >= 7:
-                        tx, ty, tz = struct.unpack("<hhh", bytes(packet[1:7]))
-                        raw_state["x"] = tx
-                        raw_state["y"] = -ty  # Vor/Zurück invertieren für intuitive Achse
-                        raw_state["z"] = -tz  # Hoch/Runter invertieren
-
-                        # Manche kompakten Modelle senden alle 6 Achsen in Report 1 (13 Bytes)
-                        if len(packet) >= 13:
-                            rx, ry, rz = struct.unpack("<hhh", bytes(packet[7:13]))
-                            raw_state["pitch"] = rx
-                            raw_state["roll"] = ry
-                            raw_state["yaw"] = rz
-
-                    # Report 2: Rotation (Pitch, Roll, Yaw) als 3x signed 16-bit int
-                    elif report_id == 2 and len(packet) >= 7:
-                        rx, ry, rz = struct.unpack("<hhh", bytes(packet[1:7]))
-                        raw_state["pitch"] = rx
-                        raw_state["roll"] = ry
-                        raw_state["yaw"] = rz
-
-                    # Report 3: Buttons (Bitmaske)
-                    elif report_id == 3 and len(packet) >= 2:
-                        btn_mask = packet[1]
-                        raw_state["buttons"] = [
-                            1 if (btn_mask & 1) else 0,
-                            1 if (btn_mask & 2) else 0,
-                        ]
-
-                if updated:
-                    axes_data = {
-                        "x": self._apply_deadzone(raw_state["x"]),
-                        "y": self._apply_deadzone(raw_state["y"]),
-                        "z": self._apply_deadzone(raw_state["z"]),
-                        "pitch": self._apply_deadzone(raw_state["pitch"]),
-                        "roll": self._apply_deadzone(raw_state["roll"]),
-                        "yaw": self._apply_deadzone(raw_state["yaw"]),
-                        "buttons": raw_state["buttons"],
-                        "timestamp": round(time.time(), 3),
+                    controllers_payload[cid] = {
+                        "id": cid,
+                        "name": entry["name"],
+                        "axes": {k: self._apply_deadzone(v) for k, v in raw.items()},
+                        "buttons": dict(btns),
                     }
-                    self.data_updated.emit(axes_data)
-
-                # Mit ~40 Hz in JSON schreiben
-                now = time.time()
-                if now - last_write >= 0.025 and self.output_path:
-                    axes_data = {
-                        "x": self._apply_deadzone(raw_state["x"]),
-                        "y": self._apply_deadzone(raw_state["y"]),
-                        "z": self._apply_deadzone(raw_state["z"]),
-                        "pitch": self._apply_deadzone(raw_state["pitch"]),
-                        "roll": self._apply_deadzone(raw_state["roll"]),
-                        "yaw": self._apply_deadzone(raw_state["yaw"]),
-                        "buttons": raw_state["buttons"],
-                        "timestamp": round(now, 3),
-                    }
-                    self._write_atomic_json(axes_data)
-                    last_write = now
-
-                time.sleep(0.005)
-            except Exception as e:
-                self.status_changed.emit(f"Verbindung getrennt ({e}) – Reconnect...", False)
-                try:
-                    dev_handle.close()
                 except Exception:
-                    pass
-                dev_handle = None
-                time.sleep(1.0)
+                    try:
+                        h.close()
+                    except Exception:
+                        pass
+                    del sm_handles[cid]
 
-        if dev_handle is not None:
+            # Pygame Joysticks / Gamepads auslesen
+            if pygame is not None:
+                pygame.event.pump()
+                for cid, joy in list(pg_joysticks.items()):
+                    try:
+                        axes = {}
+                        for a_idx in range(joy.get_numaxes()):
+                            axes[f"axis_{a_idx}"] = self._apply_deadzone(joy.get_axis(a_idx))
+
+                        # D-Pad (Hat) ebenfalls als Achsen bereitstellen
+                        for h_idx in range(joy.get_numhats()):
+                            hx, hy = joy.get_hat(h_idx)
+                            axes[f"hat_{h_idx}_x"] = float(hx)
+                            axes[f"hat_{h_idx}_y"] = float(hy)
+
+                        buttons = {}
+                        for b_idx in range(joy.get_numbuttons()):
+                            buttons[f"btn_{b_idx + 1}"] = 1 if joy.get_button(b_idx) else 0
+
+                        controllers_payload[cid] = {
+                            "id": cid,
+                            "name": joy.get_name(),
+                            "axes": axes,
+                            "buttons": buttons,
+                        }
+                    except Exception:
+                        del pg_joysticks[cid]
+
+            full_data = {
+                "timestamp": round(now, 3),
+                "controller_count": len(controllers_payload),
+                "controllers": controllers_payload,
+            }
+
+            self.state_updated.emit(full_data)
+            self.status_updated.emit(
+                f"Aktive Controller: {len(controllers_payload)}  |  Ziel: {OUTPUT_JSON.name}"
+            )
+
+            # Mit ~40 Hz atomar in JSON neben der EXE schreiben
+            if now - last_write >= 0.025:
+                self._write_atomic(full_data)
+                last_write = now
+
+            time.sleep(0.008)
+
+        for entry in sm_handles.values():
             try:
-                dev_handle.close()
+                entry["handle"].close()
             except Exception:
                 pass
+        if pygame is not None:
+            pygame.quit()
 
-    def _write_atomic_json(self, data: dict):
+    def _write_atomic(self, data: dict):
         try:
-            target = Path(self.output_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = target.with_suffix(".tmp")
-            with open(tmp_file, "w", encoding="utf-8") as f:
+            tmp = OUTPUT_JSON.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-            os.replace(tmp_file, target)
+            os.replace(tmp, OUTPUT_JSON)
         except Exception:
             pass
 
@@ -273,159 +340,142 @@ class SpaceMouseWorker(QThread):
         self.wait(1000)
 
 
+class ControllerCard(QFrame):
+    """UI-Karte für einen einzelnen erkannten Controller mit allen Achsen & Buttons."""
+
+    def __init__(self, cid: str, name: str, axes_keys: list[str], btn_keys: list[str]):
+        super().__init__()
+        self.setStyleSheet("background-color: #1e1e1e; border-radius: 10px; padding: 10px;")
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        header = QLabel(f"{name}   [{cid}]")
+        header.setStyleSheet("color: #00d2ff; font-weight: bold; font-size: 13px;")
+        layout.addWidget(header)
+
+        # Achsen-Grid (2 Spalten)
+        self.axis_bars: dict[str, BipolarAxisBar] = {}
+        axes_grid = QGridLayout()
+        axes_grid.setSpacing(8)
+        for idx, a_key in enumerate(axes_keys):
+            bar = BipolarAxisBar(a_key.upper())
+            self.axis_bars[a_key] = bar
+            axes_grid.addWidget(bar, idx // 2, idx % 2)
+        layout.addLayout(axes_grid)
+
+        # Buttons-Flow
+        self.btn_pills: dict[str, ButtonPill] = {}
+        if btn_keys:
+            btn_grid = QGridLayout()
+            btn_grid.setSpacing(5)
+            for idx, b_key in enumerate(btn_keys):
+                pill = ButtonPill(b_key.replace("btn_", "B"))
+                self.btn_pills[b_key] = pill
+                btn_grid.addWidget(pill, idx // 8, idx % 8)
+            layout.addLayout(btn_grid)
+
+    def update_values(self, axes: dict, buttons: dict):
+        for k, v in axes.items():
+            if k in self.axis_bars:
+                self.axis_bars[k].set_value(v)
+        for k, v in buttons.items():
+            if k in self.btn_pills:
+                self.btn_pills[k].set_pressed(bool(v))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Scrap Mechanic – SpaceMouse 6-DOF Bridge")
-        self.resize(520, 520)
-        self._apply_dark_theme()
-
-        config = self._load_config()
-        default_json = config.get(
-            "output_path",
-            str(Path(__file__).parent / "spacemouse_data.json"),
-        )
-        default_deadzone = config.get("deadzone", 0.03)
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(12)
-        layout.setContentsMargins(18, 18, 18, 18)
-
-        # Status-Badge
-        self.status_label = QLabel("Initialisiere SpaceMouse...")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet(
-            "background-color: #2d2d2d; color: #ffaa00; padding: 8px; "
-            "border-radius: 12px; font-weight: bold;"
-        )
-        layout.addWidget(self.status_label)
-
-        # 6 Achsen-Balken
-        axes_frame = QFrame()
-        axes_frame.setStyleSheet("background-color: #1e1e1e; border-radius: 10px; padding: 8px;")
-        axes_layout = QVBoxLayout(axes_frame)
-        axes_layout.setSpacing(8)
-
-        self.bars: dict[str, BipolarAxisBar] = {}
-        colors = ["#00d2ff", "#00d2ff", "#00d2ff", "#ff7b54", "#ff7b54", "#ff7b54"]
-        for (key, title), col in zip(AXES, colors):
-            bar = BipolarAxisBar(title, accent_color=col)
-            self.bars[key] = bar
-            axes_layout.addWidget(bar)
-
-        layout.addWidget(axes_frame)
-
-        # Deadzone & Export-Pfad Einstellungen
-        settings_frame = QFrame()
-        settings_frame.setStyleSheet("background-color: #1e1e1e; border-radius: 10px; padding: 10px;")
-        settings_layout = QVBoxLayout(settings_frame)
-
-        dz_row = QHBoxLayout()
-        dz_label = QLabel("Totzone (Deadzone):")
-        self.dz_spin = QDoubleSpinBox()
-        self.dz_spin.setRange(0.0, 0.50)
-        self.dz_spin.setSingleStep(0.01)
-        self.dz_spin.setValue(default_deadzone)
-        self.dz_spin.valueChanged.connect(self._on_settings_changed)
-        dz_row.addWidget(dz_label)
-        dz_row.addStretch()
-        dz_row.addWidget(self.dz_spin)
-        settings_layout.addLayout(dz_row)
-
-        path_label = QLabel("Ziel-JSON im Scrap Mechanic Mod-Ordner:")
-        settings_layout.addWidget(path_label)
-
-        path_row = QHBoxLayout()
-        self.path_edit = QLineEdit(default_json)
-        self.path_edit.textChanged.connect(self._on_settings_changed)
-        browse_btn = QPushButton("Durchsuchen...")
-        browse_btn.clicked.connect(self._browse_path)
-        path_row.addWidget(self.path_edit)
-        path_row.addWidget(browse_btn)
-        settings_layout.addLayout(path_row)
-
-        layout.addWidget(settings_frame)
-
-        # Worker starten
-        self.worker = SpaceMouseWorker(self.path_edit.text(), self.dz_spin.value())
-        self.worker.data_updated.connect(self._update_ui)
-        self.worker.status_changed.connect(self._update_status)
-        self.worker.start()
-
-    def _apply_dark_theme(self):
+        self.setWindowTitle("Scrap Mechanic – Universal Multi-Controller Bridge")
+        self.resize(640, 620)
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background-color: #141414;
+                background-color: #121212;
                 color: #e6e6e6;
                 font-family: 'Segoe UI', sans-serif;
             }
-            QLineEdit, QDoubleSpinBox {
-                background-color: #262626;
-                border: 1px solid #3d3d3d;
+            QDoubleSpinBox {
+                background-color: #252525;
+                border: 1px solid #3a3a3a;
                 border-radius: 6px;
-                padding: 5px 8px;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #0078d4;
+                padding: 4px 8px;
                 color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 6px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #198ae0;
             }
             """
         )
 
-    def _browse_path(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Speicherort für spacemouse_data.json wählen",
-            self.path_edit.text(),
-            "JSON Dateien (*.json)",
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(10)
+
+        # Status & Pfad-Info
+        self.status_lbl = QLabel("Suche nach Controllern...")
+        self.status_lbl.setStyleSheet(
+            "background-color: #1b2e38; color: #00d2ff; padding: 8px 12px; "
+            "border-radius: 10px; font-weight: bold;"
         )
-        if file_path:
-            self.path_edit.setText(file_path)
+        main_layout.addWidget(self.status_lbl)
 
-    def _on_settings_changed(self):
-        path = self.path_edit.text().strip()
-        dz = self.dz_spin.value()
-        self.worker.update_settings(path, dz)
-        self._save_config({"output_path": path, "deadzone": dz})
+        path_lbl = QLabel(f"Ausgabepfad (neben EXE): {OUTPUT_JSON}")
+        path_lbl.setStyleSheet("color: #888888; font-size: 11px;")
+        path_lbl.setWordWrap(True)
+        main_layout.addWidget(path_lbl)
 
-    def _update_ui(self, data: dict):
-        for key, bar in self.bars.items():
-            if key in data:
-                bar.set_value(data[key])
+        # Deadzone-Regler
+        dz_row = QHBoxLayout()
+        dz_row.addWidget(QLabel("Globale Totzone (Deadzone):"))
+        self.dz_spin = QDoubleSpinBox()
+        self.dz_spin.setRange(0.0, 0.50)
+        self.dz_spin.setSingleStep(0.01)
+        self.dz_spin.setValue(0.04)
+        self.dz_spin.valueChanged.connect(self._on_dz_changed)
+        dz_row.addStretch()
+        dz_row.addWidget(self.dz_spin)
+        main_layout.addLayout(dz_row)
 
-    def _update_status(self, text: str, ok: bool):
-        color = "#2ecc71" if ok else "#ff6b6b"
-        bg = "#1b3324" if ok else "#381e1e"
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(
-            f"background-color: {bg}; color: {color}; padding: 8px; "
-            "border-radius: 12px; font-weight: bold;"
-        )
+        # Scrollbereich für alle erkannten Controller
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.cards_container = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setSpacing(12)
+        self.cards_layout.addStretch()
+        scroll.setWidget(self.cards_container)
+        main_layout.addWidget(scroll)
 
-    def _load_config(self) -> dict:
-        if CONFIG_FILE.exists():
-            try:
-                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                return {}
-        return {}
+        self.cards: dict[str, ControllerCard] = {}
 
-    def _save_config(self, cfg: dict):
-        try:
-            CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        self.worker = MultiControllerWorker(deadzone=self.dz_spin.value())
+        self.worker.state_updated.connect(self._on_state_updated)
+        self.worker.status_updated.connect(self.status_lbl.setText)
+        self.worker.start()
+
+    def _on_dz_changed(self, val: float):
+        self.worker.deadzone = val
+
+    def _on_state_updated(self, data: dict):
+        controllers = data.get("controllers", {})
+
+        # Entfernte Controller aus UI löschen
+        for cid in list(self.cards.keys()):
+            if cid not in controllers:
+                card = self.cards.pop(cid)
+                self.cards_layout.removeWidget(card)
+                card.deleteLater()
+
+        # Neue Controller anlegen & bestehende aktualisieren
+        for cid, cdata in controllers.items():
+            axes = cdata.get("axes", {})
+            buttons = cdata.get("buttons", {})
+            if cid not in self.cards:
+                card = ControllerCard(cid, cdata.get("name", cid), list(axes.keys()), list(buttons.keys()))
+                self.cards[cid] = card
+                self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+            self.cards[cid].update_values(axes, buttons)
 
     def closeEvent(self, event):
         self.worker.stop()
