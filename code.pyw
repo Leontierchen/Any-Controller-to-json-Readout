@@ -1,22 +1,26 @@
 import ctypes
 import json
 import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -32,15 +36,183 @@ try:
 except ImportError:
     pygame = None
 
+# --------------------------------------------------------------------------
+# GitHub Update-Konfiguration
+# --------------------------------------------------------------------------
+
+GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
+GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN", "")  # Wird beim Kompilieren durch den GitHub Uploader gesetzt
+__version__ = "0.1"
+
+
+def parse_version(v_str: str) -> tuple:
+    nums = re.findall(r"\d+", v_str)
+    return tuple(map(int, nums)) if nums else (0,)
+
+
+def _build_github_headers(accept: str = "application/vnd.github+json") -> dict:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": accept,
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
+class UpdateCheckWorker(QThread):
+    """Prüft beim Programmstart asynchron im Hintergrund auf GitHub-Releases."""
+
+    result_ready = pyqtSignal(str, str, str)  # status_state ("ok", "update", "error"), latest_ver, message
+
+    def run(self):
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers=_build_github_headers())
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            latest_tag = data.get("tag_name", "").strip()
+            latest_version = latest_tag.lstrip("v")
+
+            if latest_version and parse_version(latest_version) > parse_version(__version__):
+                self.result_ready.emit(
+                    "update",
+                    latest_version,
+                    f"Neues Update verfügbar: v{latest_version} (Aktuell: v{__version__}) – Klicken zum Installieren",
+                )
+            else:
+                self.result_ready.emit(
+                    "ok",
+                    __version__,
+                    f"Aktuell (v{__version__}) – Klicken zum erneuten Prüfen",
+                )
+        except Exception:
+            self.result_ready.emit(
+                "error",
+                "",
+                f"Update-Status unbekannt (v{__version__}) – Klicken zum Prüfen",
+            )
+
+
+def check_for_github_update(parent_widget=None, manual: bool = False, status_callback=None):
+    is_frozen = getattr(sys, "frozen", False)
+    if not is_frozen and not manual:
+        return
+
+    try:
+        if status_callback:
+            status_callback("checking", "", "Prüfe GitHub auf Updates...")
+
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        req = urllib.request.Request(url, headers=_build_github_headers())
+
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        latest_tag = data.get("tag_name", "").strip()
+        latest_version = latest_tag.lstrip("v")
+
+        if not latest_version or parse_version(latest_version) <= parse_version(__version__):
+            if status_callback:
+                status_callback("ok", __version__, f"Aktuell (v{__version__}) – Klicken zum erneuten Prüfen")
+            if manual:
+                QMessageBox.information(
+                    parent_widget,
+                    "Kein Update vorhanden",
+                    f"Du verwendest bereits die aktuellste Version (v{__version__}).",
+                )
+            return
+
+        if status_callback:
+            status_callback(
+                "update",
+                latest_version,
+                f"Neues Update verfügbar: v{latest_version} (Aktuell: v{__version__}) – Klicken zum Installieren",
+            )
+
+        download_url = None
+        for asset in data.get("assets", []):
+            if asset.get("name", "").lower().endswith(".zip"):
+                download_url = asset.get("url")
+                break
+
+        if not download_url:
+            if manual:
+                QMessageBox.warning(
+                    parent_widget,
+                    "Update-Fehler",
+                    f"Eine neue Version (v{latest_version}) wurde gefunden, enthält aber kein ZIP-Paket.",
+                )
+            return
+
+        reply = QMessageBox.question(
+            parent_widget,
+            "Update verfügbar",
+            f"Eine neue Version (v{latest_version}) ist verfügbar! (Aktuell: v{__version__})\n\n"
+            f"Möchtest du das Update jetzt herunterladen und installieren?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not is_frozen:
+            QMessageBox.information(
+                parent_widget,
+                "Entwickler-Hinweis",
+                "Das Update kann nur in der gebauten EXE-Version automatisch installiert werden.",
+            )
+            return
+
+        app_dir = Path(sys.executable).resolve().parent
+        temp_zip = app_dir / "update_temp.zip"
+
+        asset_req = urllib.request.Request(
+            download_url,
+            headers=_build_github_headers(accept="application/octet-stream"),
+        )
+        with urllib.request.urlopen(asset_req, timeout=15) as resp, open(temp_zip, "wb") as out_file:
+            shutil.copyfileobj(resp, out_file)
+
+        current_exe = Path(sys.executable).resolve()
+        bat_path = app_dir / "update_updater.bat"
+
+        bat_script = f"""@echo off
+timeout /t 2 /nobreak > NUL
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$appDir = '{app_dir}'; $tempZip = '{temp_zip}'; $extractDir = Join-Path $appDir 'update_extracted'; Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; Get-ChildItem -Path $extractDir -Recurse | ForEach-Object {{ $rel = $_.FullName.Substring($extractDir.Length); $target = $appDir + $rel; if ($_.PSIsContainer) {{ if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} }} else {{ if ($_.Extension -eq '.json' -and (Test-Path $target)) {{ Write-Host 'Schütze existierende Datei: ' $target }} else {{ Copy-Item -Path $_.FullName -Destination $target -Force }} }} }}; Remove-Item -Path $extractDir -Recurse -Force; Remove-Item -Path $tempZip -Force;"
+start "" "{current_exe}"
+del "%~f0"
+"""
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_script)
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        subprocess.Popen(["cmd.exe", "/c", str(bat_path)], creationflags=creation_flags)
+        sys.exit(0)
+
+    except Exception as e:
+        if status_callback:
+            status_callback("error", "", f"Update-Prüfung fehlgeschlagen (v{__version__}) – Klicken zum Wiederholen")
+        if manual:
+            QMessageBox.critical(parent_widget, "Fehler", f"Update-Prüfung fehlgeschlagen:\n{e}")
+
 
 def ensure_single_instance(mutex_name: str = "Global\\ScrapMechanicUniversalControllerBridgeMutex"):
-    """Verhindert Mehrfachstarts unter Windows über einen Named Mutex."""
+    """Verhindert Mehrfachstarts unter Windows über einen Named Mutex und zeigt eine Info-Meldung."""
     if os.name != "nt":
         return None
     kernel32 = ctypes.windll.kernel32
     mutex = kernel32.CreateMutexW(None, False, mutex_name)
     # ERROR_ALREADY_EXISTS = 183
     if kernel32.GetLastError() == 183:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Die Universal Multi-Controller Bridge läuft bereits im Hintergrund.\n\n"
+            "Bitte prüfe deine Taskleiste oder das bereits geöffnete Fenster.",
+            "Controller Bridge bereits aktiv",
+            0x00000030 | 0x00040000,
+        )
         sys.exit(0)
     return mutex
 
@@ -52,12 +224,33 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def get_resource_path(filename: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", get_app_dir()))
+    return base / filename
+
+
 APP_DIR = get_app_dir()
 OUTPUT_JSON = APP_DIR / "controller_data.json"
 CONFIG_FILE = APP_DIR / "bridge_config.json"
+ICON_FILE = get_resource_path("Controller.ico")
 
 SPACEMOUSE_VENDORS = (0x256F, 0x046D)
 SPACEMOUSE_AXES = ["x", "y", "z", "pitch", "roll", "yaw"]
+
+
+class ClickableLabel(QLabel):
+    """Klickbares QLabel für die Update-Statuszeile."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = ""):
+        super().__init__(text)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class BipolarAxisBar(QWidget):
@@ -152,7 +345,6 @@ class MultiControllerWorker(QThread):
         self.force_rewrite = True
 
     def is_controller_enabled(self, cid: str) -> bool:
-        # Standardmäßig aktiviert (True), falls noch nicht manuell abgewählt
         return self.enabled_map.get(cid, True)
 
     def _apply_deadzone(self, val: float) -> float:
@@ -191,11 +383,9 @@ class MultiControllerWorker(QThread):
         while self.running:
             now = time.time()
 
-            # Alle 2 Sekunden nach neu angeschlossenen/getrennten Geräten suchen
             if now - last_scan >= 2.0:
                 last_scan = now
 
-                # 1. SpaceMice prüfen
                 if hid is not None:
                     current_sm = self._scan_spacemice()
                     active_sm_ids = set()
@@ -225,7 +415,6 @@ class MultiControllerWorker(QThread):
                                 pass
                             del sm_handles[cid]
 
-                # 2. Pygame Joysticks / Gamepads prüfen
                 if pygame is not None:
                     pygame.event.pump()
                     count = pygame.joystick.get_count()
@@ -249,10 +438,8 @@ class MultiControllerWorker(QThread):
                         if cid not in active_pg_ids:
                             del pg_joysticks[cid]
 
-            # Daten aller Controller für die UI-Vorschau einsammeln
             all_controllers = {}
 
-            # SpaceMouse Pakete auslesen
             for cid, entry in list(sm_handles.items()):
                 h = entry["handle"]
                 raw = entry["raw"]
@@ -296,7 +483,6 @@ class MultiControllerWorker(QThread):
                         pass
                     del sm_handles[cid]
 
-            # Pygame Joysticks / Gamepads auslesen
             if pygame is not None:
                 pygame.event.pump()
                 for cid, joy in list(pg_joysticks.items()):
@@ -323,7 +509,6 @@ class MultiControllerWorker(QThread):
                     except Exception:
                         del pg_joysticks[cid]
 
-            # Nur angehakte Controller für Scrap Mechanic filtern
             exported_controllers = {
                 cid: cdata
                 for cid, cdata in all_controllers.items()
@@ -335,7 +520,6 @@ class MultiControllerWorker(QThread):
                 f"Erkannt: {len(all_controllers)}  |  Im Spiel aktiv: {len(exported_controllers)}  |  {OUTPUT_JSON.name}"
             )
 
-            # Mit ~22 Hz prüfen und nur bei Änderung (Delta-Write) in JSON schreiben
             if now - last_write >= 0.045 or self.force_rewrite:
                 clean_data = {
                     "controller_count": len(exported_controllers),
@@ -413,7 +597,6 @@ class CheckToggle(QWidget):
             painter.setBrush(fill)
             painter.drawRoundedRect(rect, 6, 6)
 
-            # Sauberes weißes Häkchen
             pen = QPen(QColor("#ffffff"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
             painter.drawLine(6, 11, 10, 15)
@@ -447,7 +630,6 @@ class ControllerCard(QFrame):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
-        # Kopfzeile mit Custom-Haken + klickbarem Titel + schlankem Pill-Badge
         top_row = QHBoxLayout()
         top_row.setSpacing(10)
 
@@ -473,7 +655,6 @@ class ControllerCard(QFrame):
         top_row.addWidget(self.state_badge)
         layout.addLayout(top_row)
 
-        # Achsen-Grid (2 Spalten)
         self.axis_bars: dict[str, BipolarAxisBar] = {}
         axes_grid = QGridLayout()
         axes_grid.setHorizontalSpacing(14)
@@ -484,7 +665,6 @@ class ControllerCard(QFrame):
             axes_grid.addWidget(bar, idx // 2, idx % 2)
         layout.addLayout(axes_grid)
 
-        # Buttons-Flow
         self.btn_pills: dict[str, ButtonPill] = {}
         if btn_keys:
             btn_grid = QGridLayout()
@@ -523,11 +703,12 @@ class ControllerCard(QFrame):
             if k in self.btn_pills:
                 self.btn_pills[k].set_pressed(bool(v))
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Scrap Mechanic – Universal Multi-Controller Bridge")
-        self.resize(650, 620)
+        self.setWindowTitle(f"Scrap Mechanic – Universal Multi-Controller Bridge v{__version__}")
+        self.resize(650, 640)
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
@@ -573,6 +754,12 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(10)
 
+        # Klickbare Update-Statuszeile ganz oben
+        self.update_lbl = ClickableLabel(f"Prüfe auf Updates (v{__version__})... – Klicken zum Prüfen")
+        self._set_update_banner("checking", "", f"Prüfe auf Updates (v{__version__})... – Klicken zum Prüfen")
+        self.update_lbl.clicked.connect(self._on_manual_update_click)
+        main_layout.addWidget(self.update_lbl)
+
         # Status & Pfad-Info
         self.status_lbl = QLabel("Suche nach Controllern...")
         self.status_lbl.setStyleSheet(
@@ -616,6 +803,38 @@ class MainWindow(QMainWindow):
         self.worker.status_updated.connect(self.status_lbl.setText)
         self.worker.start()
 
+        # Automatische Hintergrund-Update-Prüfung beim Programmstart
+        self.update_worker = UpdateCheckWorker()
+        self.update_worker.result_ready.connect(self._on_startup_update_result)
+        self.update_worker.start()
+
+    def _set_update_banner(self, state: str, latest_ver: str, text: str):
+        self.update_lbl.setText(text)
+        if state == "update":
+            self.update_lbl.setStyleSheet(
+                "background-color: #3a2410; color: #ff9f43; border: 1px solid #d37624; "
+                "padding: 7px 12px; border-radius: 10px; font-weight: bold; font-size: 12px;"
+            )
+        elif state == "ok":
+            self.update_lbl.setStyleSheet(
+                "background-color: #153024; color: #2ecc71; border: 1px solid #22543d; "
+                "padding: 7px 12px; border-radius: 10px; font-size: 11px;"
+            )
+        else:
+            self.update_lbl.setStyleSheet(
+                "background-color: #1c1c22; color: #9a9aa6; border: 1px solid #2e2e38; "
+                "padding: 7px 12px; border-radius: 10px; font-size: 11px;"
+            )
+
+    def _on_startup_update_result(self, state: str, latest_ver: str, text: str):
+        self._set_update_banner(state, latest_ver, text)
+        # Wenn in der gebauten EXE ein neues Update gefunden wurde, direkt Installations-Dialog anbieten
+        if state == "update" and getattr(sys, "frozen", False):
+            check_for_github_update(self, manual=False, status_callback=self._set_update_banner)
+
+    def _on_manual_update_click(self):
+        check_for_github_update(self, manual=True, status_callback=self._set_update_banner)
+
     def _on_dz_changed(self, val: float):
         self.worker.deadzone = val
         self.config["deadzone"] = val
@@ -631,14 +850,12 @@ class MainWindow(QMainWindow):
     def _on_state_updated(self, data: dict):
         controllers = data.get("controllers", {})
 
-        # Entfernte Controller aus UI löschen
         for cid in list(self.cards.keys()):
             if cid not in controllers:
                 card = self.cards.pop(cid)
                 self.cards_layout.removeWidget(card)
                 card.deleteLater()
 
-        # Neue Controller anlegen & bestehende aktualisieren
         for cid, cdata in controllers.items():
             axes = cdata.get("axes", {})
             buttons = cdata.get("buttons", {})
@@ -672,12 +889,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.worker.stop()
+        if self.update_worker.isRunning():
+            self.update_worker.wait(500)
         event.accept()
 
 
 if __name__ == "__main__":
     _instance_mutex = ensure_single_instance()
     app = QApplication(sys.argv)
+    if ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(ICON_FILE)))
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
