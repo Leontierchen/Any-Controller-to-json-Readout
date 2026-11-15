@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import struct
@@ -9,6 +10,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -31,8 +33,20 @@ except ImportError:
     pygame = None
 
 
+def ensure_single_instance(mutex_name: str = "Global\\ScrapMechanicUniversalControllerBridgeMutex"):
+    """Verhindert Mehrfachstarts unter Windows über einen Named Mutex."""
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.windll.kernel32
+    mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    # ERROR_ALREADY_EXISTS = 183
+    if kernel32.GetLastError() == 183:
+        sys.exit(0)
+    return mutex
+
+
 def get_app_dir() -> Path:
-    """Gibt immer den Ordner zurück, in dem die EXE (oder das .py-Skript) liegt."""
+    """Gibt immer den Ordner zurück, in dem die EXE (oder das .pyw-Skript) liegt."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
@@ -121,15 +135,25 @@ class ButtonPill(QLabel):
 
 
 class MultiControllerWorker(QThread):
-    """Liest alle SpaceMice (HID) und Gamepads/Joysticks (Pygame) gleichzeitig aus."""
+    """Liest alle SpaceMice (HID) und Gamepads/Joysticks (Pygame) aus und schreibt nur aktivierte Geräte."""
 
     state_updated = pyqtSignal(dict)
     status_updated = pyqtSignal(str)
 
-    def __init__(self, deadzone: float = 0.04):
+    def __init__(self, deadzone: float = 0.04, enabled_map: dict[str, bool] | None = None):
         super().__init__()
         self.deadzone = deadzone
+        self.enabled_map: dict[str, bool] = dict(enabled_map) if enabled_map else {}
         self.running = True
+        self.force_rewrite = False
+
+    def set_controller_enabled(self, cid: str, enabled: bool):
+        self.enabled_map[cid] = enabled
+        self.force_rewrite = True
+
+    def is_controller_enabled(self, cid: str) -> bool:
+        # Standardmäßig aktiviert (True), falls noch nicht manuell abgewählt
+        return self.enabled_map.get(cid, True)
 
     def _apply_deadzone(self, val: float) -> float:
         val = max(-1.0, min(1.0, float(val)))
@@ -158,8 +182,8 @@ class MultiControllerWorker(QThread):
             pygame.init()
             pygame.joystick.init()
 
-        sm_handles = {}  # id -> {"handle": hid.device, "name": str, "raw": dict}
-        pg_joysticks = {}  # id -> pygame.joystick.Joystick
+        sm_handles = {}
+        pg_joysticks = {}
         last_scan = 0.0
         last_write = 0.0
         last_payload = ""
@@ -211,7 +235,6 @@ class MultiControllerWorker(QThread):
                             joy = pygame.joystick.Joystick(i)
                             if not joy.get_init():
                                 joy.init()
-                            # SpaceMouse nicht doppelt über DirectInput erfassen, falls Treiber sie als Joystick meldet
                             jname = joy.get_name()
                             if "3dconnexion" in jname.lower() or "spacemouse" in jname.lower():
                                 continue
@@ -226,8 +249,8 @@ class MultiControllerWorker(QThread):
                         if cid not in active_pg_ids:
                             del pg_joysticks[cid]
 
-            # Daten aller Controller einsammeln
-            controllers_payload = {}
+            # Daten aller Controller für die UI-Vorschau einsammeln
+            all_controllers = {}
 
             # SpaceMouse Pakete auslesen
             for cid, entry in list(sm_handles.items()):
@@ -260,7 +283,7 @@ class MultiControllerWorker(QThread):
                             for b_idx in range(8):
                                 btns[f"btn_{b_idx + 1}"] = 1 if (mask & (1 << b_idx)) else 0
 
-                    controllers_payload[cid] = {
+                    all_controllers[cid] = {
                         "id": cid,
                         "name": entry["name"],
                         "axes": {k: self._apply_deadzone(v) for k, v in raw.items()},
@@ -282,7 +305,6 @@ class MultiControllerWorker(QThread):
                         for a_idx in range(joy.get_numaxes()):
                             axes[f"axis_{a_idx}"] = self._apply_deadzone(joy.get_axis(a_idx))
 
-                        # D-Pad (Hat) ebenfalls als Achsen bereitstellen
                         for h_idx in range(joy.get_numhats()):
                             hx, hy = joy.get_hat(h_idx)
                             axes[f"hat_{h_idx}_x"] = float(hx)
@@ -292,7 +314,7 @@ class MultiControllerWorker(QThread):
                         for b_idx in range(joy.get_numbuttons()):
                             buttons[f"btn_{b_idx + 1}"] = 1 if joy.get_button(b_idx) else 0
 
-                        controllers_payload[cid] = {
+                        all_controllers[cid] = {
                             "id": cid,
                             "name": joy.get_name(),
                             "axes": axes,
@@ -301,26 +323,29 @@ class MultiControllerWorker(QThread):
                     except Exception:
                         del pg_joysticks[cid]
 
-            full_data = {
-                "timestamp": round(now, 3),
-                "controller_count": len(controllers_payload),
-                "controllers": controllers_payload,
+            # Nur angehakte Controller für Scrap Mechanic filtern
+            exported_controllers = {
+                cid: cdata
+                for cid, cdata in all_controllers.items()
+                if self.is_controller_enabled(cid)
             }
 
-            self.state_updated.emit(full_data)
+            self.state_updated.emit({"controllers": all_controllers})
             self.status_updated.emit(
-                f"Aktive Controller: {len(controllers_payload)}  |  Ziel: {OUTPUT_JSON.name}"
+                f"Erkannt: {len(all_controllers)}  |  Im Spiel aktiv: {len(exported_controllers)}  |  {OUTPUT_JSON.name}"
             )
-            
-            if now - last_write >= 0.045:
+
+            # Mit ~22 Hz prüfen und nur bei Änderung (Delta-Write) in JSON schreiben
+            if now - last_write >= 0.045 or self.force_rewrite:
                 clean_data = {
-                    "controller_count": len(controllers_payload),
-                    "controllers": controllers_payload,
+                    "controller_count": len(exported_controllers),
+                    "controllers": exported_controllers,
                 }
                 payload_str = json.dumps(clean_data, separators=(",", ":"))
-                if payload_str != last_payload:
+                if payload_str != last_payload or self.force_rewrite:
                     if self._write_safe(payload_str):
                         last_payload = payload_str
+                        self.force_rewrite = False
                 last_write = now
 
             time.sleep(0.008)
@@ -333,19 +358,8 @@ class MultiControllerWorker(QThread):
         if pygame is not None:
             pygame.quit()
 
-    def _write_atomic(self, data: dict):
-        try:
-            payload = json.dumps(data)
-            # Direktes In-Place-Schreiben verhindert NTFS-Rename-Kollisionen (Error 13)
-            with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-        except Exception:
-            pass
-    
     def _write_safe(self, payload_str: str) -> bool:
         try:
-            # Direktes Überschreiben ohne os.replace verhindert NTFS-Locking
             mode = "r+" if OUTPUT_JSON.exists() else "w"
             with open(OUTPUT_JSON, mode, encoding="utf-8") as f:
                 f.seek(0)
@@ -361,23 +375,109 @@ class MultiControllerWorker(QThread):
         self.wait(1000)
 
 
-class ControllerCard(QFrame):
-    """UI-Karte für einen einzelnen erkannten Controller mit allen Achsen & Buttons."""
+class CheckToggle(QWidget):
+    """Zeichnet ein klares, modernes Häkchen-Kästchen mit QPainter."""
 
-    def __init__(self, cid: str, name: str, axes_keys: list[str], btn_keys: list[str]):
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, checked: bool = True):
         super().__init__()
-        self.setStyleSheet("background-color: #1e1e1e; border-radius: 10px; padding: 10px;")
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        self.checked = checked
+        self.hovered = False
+        self.setFixedSize(22, 22)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        header = QLabel(f"{name}   [{cid}]")
-        header.setStyleSheet("color: #00d2ff; font-weight: bold; font-size: 13px;")
-        layout.addWidget(header)
+    def enterEvent(self, event):
+        self.hovered = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self.hovered = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.checked = not self.checked
+            self.update()
+            self.toggled.emit(self.checked)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        if self.checked:
+            border = QColor("#38e882") if self.hovered else QColor("#2ecc71")
+            fill = QColor("#23b866") if self.hovered else QColor("#1a9c54")
+            painter.setPen(QPen(border, 1.8))
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 6, 6)
+
+            # Sauberes weißes Häkchen
+            pen = QPen(QColor("#ffffff"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(6, 11, 10, 15)
+            painter.drawLine(10, 15, 16, 7)
+        else:
+            border = QColor("#777777") if self.hovered else QColor("#4a4a4a")
+            painter.setPen(QPen(border, 1.8))
+            painter.setBrush(QColor("#242424"))
+            painter.drawRoundedRect(rect, 6, 6)
+
+
+class ControllerCard(QFrame):
+    """UI-Karte für einen Controller mit sauberem Dark-Mode-Styling."""
+
+    toggled_export = pyqtSignal(str, bool)
+
+    def __init__(self, cid: str, name: str, axes_keys: list[str], btn_keys: list[str], checked: bool = True):
+        super().__init__()
+        self.cid = cid
+        self.setObjectName("ControllerCard")
+        self.setStyleSheet(
+            """
+            QFrame#ControllerCard {
+                background-color: #1b1b1e;
+                border: 1px solid #2c2c32;
+                border-radius: 12px;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        # Kopfzeile mit Custom-Haken + klickbarem Titel + schlankem Pill-Badge
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+
+        self.check_box = CheckToggle(checked=checked)
+        self.check_box.toggled.connect(self._on_check_changed)
+
+        self.title_lbl = QLabel(f"{name}")
+        self.title_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.title_lbl.mousePressEvent = lambda e: self.check_box.mousePressEvent(e)
+
+        self.id_lbl = QLabel(f"[{cid}]")
+        self.id_lbl.setStyleSheet("color: #6c6c75; font-size: 11px; font-family: 'Consolas', monospace;")
+
+        self.state_badge = QLabel()
+        self.state_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.state_badge.setFixedHeight(22)
+        self._update_badge_style(checked)
+
+        top_row.addWidget(self.check_box)
+        top_row.addWidget(self.title_lbl)
+        top_row.addWidget(self.id_lbl)
+        top_row.addStretch()
+        top_row.addWidget(self.state_badge)
+        layout.addLayout(top_row)
 
         # Achsen-Grid (2 Spalten)
         self.axis_bars: dict[str, BipolarAxisBar] = {}
         axes_grid = QGridLayout()
-        axes_grid.setSpacing(8)
+        axes_grid.setHorizontalSpacing(14)
+        axes_grid.setVerticalSpacing(6)
         for idx, a_key in enumerate(axes_keys):
             bar = BipolarAxisBar(a_key.upper())
             self.axis_bars[a_key] = bar
@@ -388,12 +488,32 @@ class ControllerCard(QFrame):
         self.btn_pills: dict[str, ButtonPill] = {}
         if btn_keys:
             btn_grid = QGridLayout()
-            btn_grid.setSpacing(5)
+            btn_grid.setSpacing(6)
             for idx, b_key in enumerate(btn_keys):
                 pill = ButtonPill(b_key.replace("btn_", "B"))
                 self.btn_pills[b_key] = pill
                 btn_grid.addWidget(pill, idx // 8, idx % 8)
             layout.addLayout(btn_grid)
+
+    def _on_check_changed(self, state: bool):
+        self._update_badge_style(state)
+        self.toggled_export.emit(self.cid, state)
+
+    def _update_badge_style(self, active: bool):
+        if active:
+            self.state_badge.setText("AKTIV")
+            self.state_badge.setStyleSheet(
+                "background-color: #153626; color: #2ecc71; border: 1px solid #235c40; "
+                "border-radius: 11px; padding: 0px 10px; font-size: 10px; font-weight: bold;"
+            )
+            self.title_lbl.setStyleSheet("color: #00d2ff; font-weight: bold; font-size: 13px;")
+        else:
+            self.state_badge.setText("IGNORIERT")
+            self.state_badge.setStyleSheet(
+                "background-color: #252529; color: #777780; border: 1px solid #35353b; "
+                "border-radius: 11px; padding: 0px 10px; font-size: 10px; font-weight: bold;"
+            )
+            self.title_lbl.setStyleSheet("color: #777780; font-weight: bold; font-size: 13px;")
 
     def update_values(self, axes: dict, buttons: dict):
         for k, v in axes.items():
@@ -403,28 +523,49 @@ class ControllerCard(QFrame):
             if k in self.btn_pills:
                 self.btn_pills[k].set_pressed(bool(v))
 
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Scrap Mechanic – Universal Multi-Controller Bridge")
-        self.resize(640, 620)
+        self.resize(650, 620)
         self.setStyleSheet(
             """
             QMainWindow, QWidget {
-                background-color: #121212;
+                background-color: #121215;
                 color: #e6e6e6;
                 font-family: 'Segoe UI', sans-serif;
             }
             QDoubleSpinBox {
-                background-color: #252525;
-                border: 1px solid #3a3a3a;
+                background-color: #1e1e23;
+                border: 1px solid #34343c;
                 border-radius: 6px;
-                padding: 4px 8px;
+                padding: 4px 10px;
                 color: white;
+                font-weight: bold;
+            }
+            QScrollBar:vertical {
+                background: #16161a;
+                width: 8px;
+                border-radius: 4px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #363640;
+                min-height: 28px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00d2ff;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
             }
             """
         )
+
+        self.config = self._load_config()
+        saved_deadzone = float(self.config.get("deadzone", 0.04))
+        saved_enabled = self.config.get("enabled_controllers", {})
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -451,7 +592,7 @@ class MainWindow(QMainWindow):
         self.dz_spin = QDoubleSpinBox()
         self.dz_spin.setRange(0.0, 0.50)
         self.dz_spin.setSingleStep(0.01)
-        self.dz_spin.setValue(0.04)
+        self.dz_spin.setValue(saved_deadzone)
         self.dz_spin.valueChanged.connect(self._on_dz_changed)
         dz_row.addStretch()
         dz_row.addWidget(self.dz_spin)
@@ -470,13 +611,22 @@ class MainWindow(QMainWindow):
 
         self.cards: dict[str, ControllerCard] = {}
 
-        self.worker = MultiControllerWorker(deadzone=self.dz_spin.value())
+        self.worker = MultiControllerWorker(deadzone=saved_deadzone, enabled_map=saved_enabled)
         self.worker.state_updated.connect(self._on_state_updated)
         self.worker.status_updated.connect(self.status_lbl.setText)
         self.worker.start()
 
     def _on_dz_changed(self, val: float):
         self.worker.deadzone = val
+        self.config["deadzone"] = val
+        self._save_config()
+
+    def _on_controller_toggled(self, cid: str, enabled: bool):
+        self.worker.set_controller_enabled(cid, enabled)
+        if "enabled_controllers" not in self.config:
+            self.config["enabled_controllers"] = {}
+        self.config["enabled_controllers"][cid] = enabled
+        self._save_config()
 
     def _on_state_updated(self, data: dict):
         controllers = data.get("controllers", {})
@@ -493,10 +643,32 @@ class MainWindow(QMainWindow):
             axes = cdata.get("axes", {})
             buttons = cdata.get("buttons", {})
             if cid not in self.cards:
-                card = ControllerCard(cid, cdata.get("name", cid), list(axes.keys()), list(buttons.keys()))
+                is_checked = self.worker.is_controller_enabled(cid)
+                card = ControllerCard(
+                    cid,
+                    cdata.get("name", cid),
+                    list(axes.keys()),
+                    list(buttons.keys()),
+                    checked=is_checked,
+                )
+                card.toggled_export.connect(self._on_controller_toggled)
                 self.cards[cid] = card
                 self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
             self.cards[cid].update_values(axes, buttons)
+
+    def _load_config(self) -> dict:
+        if CONFIG_FILE.exists():
+            try:
+                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _save_config(self):
+        try:
+            CONFIG_FILE.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -504,6 +676,7 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    _instance_mutex = ensure_single_instance()
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()

@@ -1,0 +1,8 @@
+{
+  "enabled_controllers": {
+    "spacemouse_0": false,
+    "joy_0": false,
+    "joy_3": true,
+    "joy_2": false
+  }
+}
