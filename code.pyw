@@ -79,19 +79,19 @@ class UpdateCheckWorker(QThread):
                 self.result_ready.emit(
                     "update",
                     latest_version,
-                    f"Neues Update verfügbar: v{latest_version} (Aktuell: v{__version__}) – Klicken zum Installieren",
+                    f"App Version v{__version__} - veraltet - Neues Update verfügbar: v{latest_version} – Klicken zum Installieren",
                 )
             else:
                 self.result_ready.emit(
                     "ok",
                     __version__,
-                    f"Aktuell (v{__version__}) – Klicken zum erneuten Prüfen",
+                    f"App Version v{__version__} - aktuell – Klicken zum erneuten Prüfen",
                 )
         except Exception:
             self.result_ready.emit(
                 "error",
                 "",
-                f"Update-Status unbekannt (v{__version__}) – Klicken zum Prüfen",
+                f"App Version v{__version__} - status unbekannt – Klicken zum Prüfen",
             )
 
 
@@ -115,7 +115,7 @@ def check_for_github_update(parent_widget=None, manual: bool = False, status_cal
 
         if not latest_version or parse_version(latest_version) <= parse_version(__version__):
             if status_callback:
-                status_callback("ok", __version__, f"Aktuell (v{__version__}) – Klicken zum erneuten Prüfen")
+                status_callback("ok", __version__, f"App Version v{__version__} - Aktuell – Klicken zum erneuten Prüfen")
             if manual:
                 QMessageBox.information(
                     parent_widget,
@@ -128,7 +128,7 @@ def check_for_github_update(parent_widget=None, manual: bool = False, status_cal
             status_callback(
                 "update",
                 latest_version,
-                f"Neues Update verfügbar: v{latest_version} (Aktuell: v{__version__}) – Klicken zum Installieren",
+                f"App Version v{__version__} - Neues Update verfügbar: v{latest_version} – Klicken zum Installieren",
             )
 
         download_url = None
@@ -193,7 +193,7 @@ del "%~f0"
 
     except Exception as e:
         if status_callback:
-            status_callback("error", "", f"Update-Prüfung fehlgeschlagen (v{__version__}) – Klicken zum Wiederholen")
+            status_callback("error", "", f"App Version v{__version__} - Update-Prüfung fehlgeschlagen – Klicken zum Wiederholen")
         if manual:
             QMessageBox.critical(parent_widget, "Fehler", f"Update-Prüfung fehlgeschlagen:\n{e}")
 
