@@ -162,6 +162,7 @@ class MultiControllerWorker(QThread):
         pg_joysticks = {}  # id -> pygame.joystick.Joystick
         last_scan = 0.0
         last_write = 0.0
+        last_payload = ""
 
         while self.running:
             now = time.time()
@@ -310,10 +311,16 @@ class MultiControllerWorker(QThread):
             self.status_updated.emit(
                 f"Aktive Controller: {len(controllers_payload)}  |  Ziel: {OUTPUT_JSON.name}"
             )
-
-            # Mit ~40 Hz atomar in JSON neben der EXE schreiben
-            if now - last_write >= 0.025:
-                self._write_atomic(full_data)
+            
+            if now - last_write >= 0.045:
+                clean_data = {
+                    "controller_count": len(controllers_payload),
+                    "controllers": controllers_payload,
+                }
+                payload_str = json.dumps(clean_data, separators=(",", ":"))
+                if payload_str != last_payload:
+                    if self._write_safe(payload_str):
+                        last_payload = payload_str
                 last_write = now
 
             time.sleep(0.008)
@@ -328,12 +335,26 @@ class MultiControllerWorker(QThread):
 
     def _write_atomic(self, data: dict):
         try:
-            tmp = OUTPUT_JSON.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, OUTPUT_JSON)
+            payload = json.dumps(data)
+            # Direktes In-Place-Schreiben verhindert NTFS-Rename-Kollisionen (Error 13)
+            with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
         except Exception:
             pass
+    
+    def _write_safe(self, payload_str: str) -> bool:
+        try:
+            # Direktes Überschreiben ohne os.replace verhindert NTFS-Locking
+            mode = "r+" if OUTPUT_JSON.exists() else "w"
+            with open(OUTPUT_JSON, mode, encoding="utf-8") as f:
+                f.seek(0)
+                f.write(payload_str)
+                f.truncate()
+                f.flush()
+            return True
+        except Exception:
+            return False
 
     def stop(self):
         self.running = False
