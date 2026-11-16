@@ -9,3 +9,5 @@ releases/
 sm_spacemouse_config.json
 controller_data.json
 bridge_config.json
+backup/
+controller_data.lua
