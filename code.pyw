@@ -10,7 +10,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -42,7 +42,7 @@ except ImportError:
 
 GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
 GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN", "")  # Wird beim Kompilieren durch den GitHub Uploader gesetzt
-__version__ = "0.3"
+__version__ = "0.2"
 
 
 def parse_version(v_str: str) -> tuple:
@@ -166,30 +166,68 @@ def check_for_github_update(parent_widget=None, manual: bool = False, status_cal
             return
 
         app_dir = Path(sys.executable).resolve().parent
+        current_exe = Path(sys.executable).resolve()
         temp_zip = app_dir / "update_temp.zip"
 
         asset_req = urllib.request.Request(
             download_url,
             headers=_build_github_headers(accept="application/octet-stream"),
         )
-        with urllib.request.urlopen(asset_req, timeout=15) as resp, open(temp_zip, "wb") as out_file:
+        with urllib.request.urlopen(asset_req, timeout=20) as resp, open(temp_zip, "wb") as out_file:
             shutil.copyfileobj(resp, out_file)
 
-        current_exe = Path(sys.executable).resolve()
         bat_path = app_dir / "update_updater.bat"
 
         bat_script = f"""@echo off
+setlocal
+set "_MEIPASS2="
+set "UPD_APP_DIR={app_dir}"
+set "UPD_TEMP_ZIP={temp_zip}"
+set "UPD_EXE={current_exe}"
+
 timeout /t 2 /nobreak > NUL
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$appDir = '{app_dir}'; $tempZip = '{temp_zip}'; $extractDir = Join-Path $appDir 'update_extracted'; Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; Get-ChildItem -Path $extractDir -Recurse | ForEach-Object {{ $rel = $_.FullName.Substring($extractDir.Length); $target = $appDir + $rel; if ($_.PSIsContainer) {{ if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} }} else {{ if ($_.Extension -eq '.json' -and (Test-Path $target)) {{ Write-Host 'Schütze existierende Datei: ' $target }} else {{ Copy-Item -Path $_.FullName -Destination $target -Force }} }} }}; Remove-Item -Path $extractDir -Recurse -Force; Remove-Item -Path $tempZip -Force;"
-start "" "{current_exe}"
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$appDir = $env:UPD_APP_DIR; " ^
+  "$tempZip = $env:UPD_TEMP_ZIP; " ^
+  "$extractDir = Join-Path $appDir 'update_extracted'; " ^
+  "if (Test-Path $extractDir) {{ Remove-Item -Path $extractDir -Recurse -Force }}; " ^
+  "Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; " ^
+  "$items = Get-ChildItem -Path $extractDir; " ^
+  "$sourceRoot = if ($items.Count -eq 1 -and $items[0].PSIsContainer) {{ $items[0].FullName }} else {{ $extractDir }}; " ^
+  "Get-ChildItem -Path $sourceRoot -Recurse | ForEach-Object {{ " ^
+  "  $rel = $_.FullName.Substring($sourceRoot.Length); " ^
+  "  $target = Join-Path $appDir $rel; " ^
+  "  if ($_.PSIsContainer) {{ " ^
+  "    if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} " ^
+  "  }} else {{ " ^
+  "    if ($_.Name -eq 'bridge_config.json' -and (Test-Path $target)) {{ " ^
+  "      Write-Host 'Schuetze Konfiguration:' $target " ^
+  "    }} else {{ " ^
+  "      Copy-Item -Path $_.FullName -Destination $target -Force " ^
+  "    }} " ^
+  "  }} " ^
+  "}}; " ^
+  "Remove-Item -Path $extractDir -Recurse -Force; " ^
+  "Remove-Item -Path $tempZip -Force; " ^
+  "Start-Process -FilePath $env:UPD_EXE -ArgumentList '--updated-restart' -WorkingDirectory $appDir"
+
 del "%~f0"
 """
         with open(bat_path, "w", encoding="utf-8") as f:
             f.write(bat_script)
 
+        clean_env = os.environ.copy()
+        clean_env.pop("_MEIPASS2", None)
+
         creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        subprocess.Popen(["cmd.exe", "/c", str(bat_path)], creationflags=creation_flags)
-        sys.exit(0)
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(bat_path)],
+            cwd=str(app_dir),
+            env=clean_env,
+            creationflags=creation_flags,
+        )
+        os._exit(0)
 
     except Exception as e:
         if status_callback:
@@ -199,22 +237,31 @@ del "%~f0"
 
 
 def ensure_single_instance(mutex_name: str = "Global\\ScrapMechanicUniversalControllerBridgeMutex"):
-    """Verhindert Mehrfachstarts unter Windows über einen Named Mutex und zeigt eine Info-Meldung."""
+    """Verhindert Mehrfachstarts unter Windows; wartet beim Update-Neustart kurz auf Mutex-Freigabe."""
     if os.name != "nt":
         return None
     kernel32 = ctypes.windll.kernel32
-    mutex = kernel32.CreateMutexW(None, False, mutex_name)
-    # ERROR_ALREADY_EXISTS = 183
-    if kernel32.GetLastError() == 183:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "Die Universal Multi-Controller Bridge läuft bereits im Hintergrund.\n\n"
-            "Bitte prüfe deine Taskleiste oder das bereits geöffnete Fenster.",
-            "Controller Bridge bereits aktiv",
-            0x00000030 | 0x00040000,
-        )
-        sys.exit(0)
-    return mutex
+    is_restart = "--updated-restart" in sys.argv
+    retries = 15 if is_restart else 1
+
+    mutex = None
+    for _ in range(retries):
+        mutex = kernel32.CreateMutexW(None, False, mutex_name)
+        if kernel32.GetLastError() != 183:  # 183 = ERROR_ALREADY_EXISTS
+            return mutex
+        if mutex:
+            kernel32.CloseHandle(mutex)
+        if is_restart:
+            time.sleep(0.25)
+
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        "Die Universal Multi-Controller Bridge läuft bereits im Hintergrund.\n\n"
+        "Bitte prüfe deine Taskleiste oder das bereits geöffnete Fenster.",
+        "Controller Bridge bereits aktiv",
+        0x00000030 | 0x00040000,
+    )
+    sys.exit(0)
 
 
 def get_app_dir() -> Path:
@@ -828,9 +875,8 @@ class MainWindow(QMainWindow):
 
     def _on_startup_update_result(self, state: str, latest_ver: str, text: str):
         self._set_update_banner(state, latest_ver, text)
-        # Wenn in der gebauten EXE ein neues Update gefunden wurde, direkt Installations-Dialog anbieten
         if state == "update" and getattr(sys, "frozen", False):
-            check_for_github_update(self, manual=False, status_callback=self._set_update_banner)
+            QTimer.singleShot(0, lambda: check_for_github_update(self, manual=False, status_callback=self._set_update_banner))
 
     def _on_manual_update_click(self):
         check_for_github_update(self, manual=True, status_callback=self._set_update_banner)
