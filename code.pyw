@@ -42,7 +42,7 @@ except ImportError:
 
 GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
 GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN", "")  # Wird beim Kompilieren durch den GitHub Uploader gesetzt
-__version__ = "0.3"
+__version__ = "0.2"
 
 
 def parse_version(v_str: str) -> tuple:
@@ -58,26 +58,6 @@ def _build_github_headers(accept: str = "application/vnd.github+json") -> dict:
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return headers
-
-
-def _to_lua_literal(val) -> str:
-    """Konvertiert Python-Datenstrukturen kompakt in ein gültiges Lua-Table-Literal."""
-    if isinstance(val, bool):
-        return "true" if val else "false"
-    if isinstance(val, float):
-        return f"{val:.4f}"
-    if isinstance(val, int):
-        return str(val)
-    if isinstance(val, str):
-        escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
-        return f'"{escaped}"'
-    if isinstance(val, dict):
-        items = [f"[{_to_lua_literal(str(k))}]={_to_lua_literal(v)}" for k, v in val.items()]
-        return "{" + ",".join(items) + "}"
-    if isinstance(val, (list, tuple)):
-        items = [_to_lua_literal(v) for v in val]
-        return "{" + ",".join(items) + "}"
-    return "nil"
 
 
 class UpdateCheckWorker(QThread):
@@ -200,7 +180,7 @@ def check_for_github_update(parent_widget=None, manual: bool = False, status_cal
 
         bat_script = f"""@echo off
 timeout /t 2 /nobreak > NUL
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$appDir = '{app_dir}'; $tempZip = '{temp_zip}'; $extractDir = Join-Path $appDir 'update_extracted'; Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; Get-ChildItem -Path $extractDir -Recurse | ForEach-Object {{ $rel = $_.FullName.Substring($extractDir.Length); $target = $appDir + $rel; if ($_.PSIsContainer) {{ if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} }} else {{ if ($_.Name -eq 'bridge_config.json' -and (Test-Path $target)) {{ Write-Host 'Schütze existierende Konfiguration: ' $target }} else {{ Copy-Item -Path $_.FullName -Destination $target -Force }} }} }}; Remove-Item -Path $extractDir -Recurse -Force; Remove-Item -Path $tempZip -Force;"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$appDir = '{app_dir}'; $tempZip = '{temp_zip}'; $extractDir = Join-Path $appDir 'update_extracted'; Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; Get-ChildItem -Path $extractDir -Recurse | ForEach-Object {{ $rel = $_.FullName.Substring($extractDir.Length); $target = $appDir + $rel; if ($_.PSIsContainer) {{ if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} }} else {{ if ($_.Extension -eq '.json' -and (Test-Path $target)) {{ Write-Host 'Schütze existierende Datei: ' $target }} else {{ Copy-Item -Path $_.FullName -Destination $target -Force }} }} }}; Remove-Item -Path $extractDir -Recurse -Force; Remove-Item -Path $tempZip -Force;"
 start "" "{current_exe}"
 del "%~f0"
 """
@@ -250,7 +230,7 @@ def get_resource_path(filename: str) -> Path:
 
 
 APP_DIR = get_app_dir()
-OUTPUT_LUA = APP_DIR / "controller_data.lua"
+OUTPUT_JSON = APP_DIR / "controller_data.json"
 CONFIG_FILE = APP_DIR / "bridge_config.json"
 ICON_FILE = get_resource_path("Controller.ico")
 
@@ -348,7 +328,7 @@ class ButtonPill(QLabel):
 
 
 class MultiControllerWorker(QThread):
-    """Liest alle SpaceMice (HID) und Gamepads/Joysticks (Pygame) aus und schreibt nur aktivierte Geräte als Lua-Table."""
+    """Liest alle SpaceMice (HID) und Gamepads/Joysticks (Pygame) aus und schreibt nur aktivierte Geräte."""
 
     state_updated = pyqtSignal(dict)
     status_updated = pyqtSignal(str)
@@ -399,10 +379,6 @@ class MultiControllerWorker(QThread):
         last_scan = 0.0
         last_write = 0.0
         last_payload = ""
-
-        # Beim Start einmalig sicherstellen, dass eine gültige controller_data.lua existiert
-        if not OUTPUT_LUA.exists():
-            self._write_safe("return {[\"controller_count\"]=0,[\"controllers\"]={}}\n")
 
         while self.running:
             now = time.time()
@@ -541,7 +517,7 @@ class MultiControllerWorker(QThread):
 
             self.state_updated.emit({"controllers": all_controllers})
             self.status_updated.emit(
-                f"Erkannt: {len(all_controllers)}  |  Im Spiel aktiv: {len(exported_controllers)}  |  {OUTPUT_LUA.name}"
+                f"Erkannt: {len(all_controllers)}  |  Im Spiel aktiv: {len(exported_controllers)}  |  {OUTPUT_JSON.name}"
             )
 
             if now - last_write >= 0.045 or self.force_rewrite:
@@ -549,7 +525,7 @@ class MultiControllerWorker(QThread):
                     "controller_count": len(exported_controllers),
                     "controllers": exported_controllers,
                 }
-                payload_str = "return " + _to_lua_literal(clean_data) + "\n"
+                payload_str = json.dumps(clean_data, separators=(",", ":"))
                 if payload_str != last_payload or self.force_rewrite:
                     if self._write_safe(payload_str):
                         last_payload = payload_str
@@ -567,12 +543,13 @@ class MultiControllerWorker(QThread):
             pygame.quit()
 
     def _write_safe(self, payload_str: str) -> bool:
-        """Schreibt atomar über eine Temp-Datei + os.replace(), um Windows-File-Locks zu vermeiden."""
-        tmp_path = OUTPUT_LUA.with_suffix(".lua.tmp")
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            mode = "r+" if OUTPUT_JSON.exists() else "w"
+            with open(OUTPUT_JSON, mode, encoding="utf-8") as f:
+                f.seek(0)
                 f.write(payload_str)
-            os.replace(tmp_path, OUTPUT_LUA)
+                f.truncate()
+                f.flush()
             return True
         except Exception:
             return False
@@ -791,7 +768,7 @@ class MainWindow(QMainWindow):
         )
         main_layout.addWidget(self.status_lbl)
 
-        path_lbl = QLabel(f"Ausgabepfad (neben EXE): {OUTPUT_LUA}")
+        path_lbl = QLabel(f"Ausgabepfad (neben EXE): {OUTPUT_JSON}")
         path_lbl.setStyleSheet("color: #888888; font-size: 11px;")
         path_lbl.setWordWrap(True)
         main_layout.addWidget(path_lbl)
