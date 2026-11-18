@@ -42,7 +42,7 @@ except ImportError:
 
 GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
 GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN", "")  # Wird beim Kompilieren durch den GitHub Uploader gesetzt
-__version__ = "0.3.1"
+__version__ = "0.3"
 
 
 def parse_version(v_str: str) -> tuple:
