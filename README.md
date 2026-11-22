@@ -133,5 +133,6 @@ All settings are automatically persisted in `bridge_config.json`:
 
 ## 🙏 Credits & Acknowledgments
 
+* Google Gemini
 * Controller auto-mapping database powered by **[mdqinc/SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)**.
 * Built with **Python**, **PyQt6**, **pygame (SDL2)**, and **hidapi**.
