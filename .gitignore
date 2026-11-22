@@ -5,10 +5,7 @@ build/
 dist/
 *.spec
 releases/
-
-sm_spacemouse_config.json
-controller_data.json
-bridge_config.json
+*.json
 backup/
-controller_data.lua
 UPDATE_NOTES.md
+gamecontrollerdb.txt
