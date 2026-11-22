@@ -36,167 +36,10 @@ try:
 except ImportError:
     pygame = None
 
-# --------------------------------------------------------------------------
-# GitHub Update-Konfiguration
-# --------------------------------------------------------------------------
+import updater
 
-GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
-GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN", "")  # Wird beim Kompilieren durch den GitHub Uploader gesetzt
 __version__ = "0.3"
-
-
-def parse_version(v_str: str) -> tuple:
-    nums = re.findall(r"\d+", v_str)
-    return tuple(map(int, nums)) if nums else (0,)
-
-
-def _build_github_headers(accept: str = "application/vnd.github+json") -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": accept,
-    }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
-
-
-class UpdateCheckWorker(QThread):
-    """Prüft beim Programmstart asynchron im Hintergrund auf GitHub-Releases."""
-
-    result_ready = pyqtSignal(str, str, str)  # status_state ("ok", "update", "error"), latest_ver, message
-
-    def run(self):
-        try:
-            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-            req = urllib.request.Request(url, headers=_build_github_headers())
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            latest_tag = data.get("tag_name", "").strip()
-            latest_version = latest_tag.lstrip("v")
-
-            if latest_version and parse_version(latest_version) > parse_version(__version__):
-                self.result_ready.emit(
-                    "update",
-                    latest_version,
-                    f"App Version v{__version__} - veraltet - Neues Update verfügbar: v{latest_version} – Klicken zum Installieren",
-                )
-            else:
-                self.result_ready.emit(
-                    "ok",
-                    __version__,
-                    f"App Version v{__version__} - aktuell – Klicken zum erneuten Prüfen",
-                )
-        except Exception:
-            self.result_ready.emit(
-                "error",
-                "",
-                f"App Version v{__version__} - status unbekannt – Klicken zum Prüfen",
-            )
-
-
-def check_for_github_update(parent_widget=None, manual: bool = False, status_callback=None):
-    is_frozen = getattr(sys, "frozen", False)
-    if not is_frozen and not manual:
-        return
-
-    try:
-        if status_callback:
-            status_callback("checking", "", "Prüfe GitHub auf Updates...")
-
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        req = urllib.request.Request(url, headers=_build_github_headers())
-
-        with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        latest_tag = data.get("tag_name", "").strip()
-        latest_version = latest_tag.lstrip("v")
-
-        if not latest_version or parse_version(latest_version) <= parse_version(__version__):
-            if status_callback:
-                status_callback("ok", __version__, f"App Version v{__version__} - Aktuell – Klicken zum erneuten Prüfen")
-            if manual:
-                QMessageBox.information(
-                    parent_widget,
-                    "Kein Update vorhanden",
-                    f"Du verwendest bereits die aktuellste Version (v{__version__}).",
-                )
-            return
-
-        if status_callback:
-            status_callback(
-                "update",
-                latest_version,
-                f"App Version v{__version__} - Neues Update verfügbar: v{latest_version} – Klicken zum Installieren",
-            )
-
-        download_url = None
-        for asset in data.get("assets", []):
-            if asset.get("name", "").lower().endswith(".zip"):
-                download_url = asset.get("url")
-                break
-
-        if not download_url:
-            if manual:
-                QMessageBox.warning(
-                    parent_widget,
-                    "Update-Fehler",
-                    f"Eine neue Version (v{latest_version}) wurde gefunden, enthält aber kein ZIP-Paket.",
-                )
-            return
-
-        reply = QMessageBox.question(
-            parent_widget,
-            "Update verfügbar",
-            f"Eine neue Version (v{latest_version}) ist verfügbar! (Aktuell: v{__version__})\n\n"
-            f"Möchtest du das Update jetzt herunterladen und installieren?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        if not is_frozen:
-            QMessageBox.information(
-                parent_widget,
-                "Entwickler-Hinweis",
-                "Das Update kann nur in der gebauten EXE-Version automatisch installiert werden.",
-            )
-            return
-
-        app_dir = Path(sys.executable).resolve().parent
-        temp_zip = app_dir / "update_temp.zip"
-
-        asset_req = urllib.request.Request(
-            download_url,
-            headers=_build_github_headers(accept="application/octet-stream"),
-        )
-        with urllib.request.urlopen(asset_req, timeout=15) as resp, open(temp_zip, "wb") as out_file:
-            shutil.copyfileobj(resp, out_file)
-
-        current_exe = Path(sys.executable).resolve()
-        bat_path = app_dir / "update_updater.bat"
-
-        bat_script = f"""@echo off
-timeout /t 2 /nobreak > NUL
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$appDir = '{app_dir}'; $tempZip = '{temp_zip}'; $extractDir = Join-Path $appDir 'update_extracted'; Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force; Get-ChildItem -Path $extractDir -Recurse | ForEach-Object {{ $rel = $_.FullName.Substring($extractDir.Length); $target = $appDir + $rel; if ($_.PSIsContainer) {{ if (-not (Test-Path $target)) {{ New-Item -ItemType Directory -Path $target | Out-Null }} }} else {{ if ($_.Extension -eq '.json' -and (Test-Path $target)) {{ Write-Host 'Schütze existierende Datei: ' $target }} else {{ Copy-Item -Path $_.FullName -Destination $target -Force }} }} }}; Remove-Item -Path $extractDir -Recurse -Force; Remove-Item -Path $tempZip -Force;"
-start "" "{current_exe}"
-del "%~f0"
-"""
-        with open(bat_path, "w", encoding="utf-8") as f:
-            f.write(bat_script)
-
-        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        subprocess.Popen(["cmd.exe", "/c", str(bat_path)], creationflags=creation_flags)
-        sys.exit(0)
-
-    except Exception as e:
-        if status_callback:
-            status_callback("error", "", f"App Version v{__version__} - Update-Prüfung fehlgeschlagen – Klicken zum Wiederholen")
-        if manual:
-            QMessageBox.critical(parent_widget, "Fehler", f"Update-Prüfung fehlgeschlagen:\n{e}")
-
+GITHUB_REPO = "Leontierchen/Any-Controller-to-json-Readout"
 
 
 def get_app_dir() -> Path:
@@ -218,6 +61,36 @@ ICON_FILE = get_resource_path("Controller.ico")
 
 SPACEMOUSE_VENDORS = (0x256F, 0x046D)
 SPACEMOUSE_AXES = ["x", "y", "z", "pitch", "roll", "yaw"]
+
+
+class UpdateCheckWorker(QThread):
+    """Prüft im Hintergrund auf neue GitHub-Releases, ohne die GUI zu blockieren."""
+
+    result_ready = pyqtSignal(object, bool)  # (update_dict oder None, manual_click)
+
+    def __init__(self, manual: bool = False):
+        super().__init__()
+        self.manual = manual
+
+    def run(self):
+        update_info = updater.check_for_updates(GITHUB_REPO, __version__)
+        self.result_ready.emit(update_info, self.manual)
+
+
+class UpdateDownloadWorker(QThread):
+    """Lädt das Update herunter und startet die Installation."""
+
+    progress_changed = pyqtSignal(int)
+    failed = pyqtSignal()
+
+    def __init__(self, update_info: dict):
+        super().__init__()
+        self.update_info = update_info
+
+    def run(self):
+        ok = updater.download_and_install(self.update_info, progress_callback=self.progress_changed.emit)
+        if not ok:
+            self.failed.emit()
 
 
 class ClickableLabel(QLabel):
@@ -729,6 +602,9 @@ class MainWindow(QMainWindow):
         self.config = self._load_config()
         saved_deadzone = float(self.config.get("deadzone", 0.04))
         saved_enabled = self.config.get("enabled_controllers", {})
+        self.latest_update_info: dict | None = None
+        self.update_worker: UpdateCheckWorker | None = None
+        self.download_worker: UpdateDownloadWorker | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -737,8 +613,8 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
 
         # Klickbare Update-Statuszeile ganz oben
-        self.update_lbl = ClickableLabel(f"Prüfe auf Updates (v{__version__})... – Klicken zum Prüfen")
-        self._set_update_banner("checking", "", f"Prüfe auf Updates (v{__version__})... – Klicken zum Prüfen")
+        self.update_lbl = ClickableLabel(f"Prüfe auf Updates (v{__version__})...")
+        self._set_update_banner("checking", f"Prüfe auf Updates (v{__version__})...")
         self.update_lbl.clicked.connect(self._on_manual_update_click)
         main_layout.addWidget(self.update_lbl)
 
@@ -786,11 +662,9 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
         # Automatische Hintergrund-Update-Prüfung beim Programmstart
-        self.update_worker = UpdateCheckWorker()
-        self.update_worker.result_ready.connect(self._on_startup_update_result)
-        self.update_worker.start()
+        self._start_update_check(manual=False)
 
-    def _set_update_banner(self, state: str, latest_ver: str, text: str):
+    def _set_update_banner(self, state: str, text: str):
         self.update_lbl.setText(text)
         if state == "update":
             self.update_lbl.setStyleSheet(
@@ -808,14 +682,76 @@ class MainWindow(QMainWindow):
                 "padding: 7px 12px; border-radius: 10px; font-size: 11px;"
             )
 
-    def _on_startup_update_result(self, state: str, latest_ver: str, text: str):
-        self._set_update_banner(state, latest_ver, text)
-        # Wenn in der gebauten EXE ein neues Update gefunden wurde, direkt Installations-Dialog anbieten
-        if state == "update" and getattr(sys, "frozen", False):
-            check_for_github_update(self, manual=False, status_callback=self._set_update_banner)
+    def _start_update_check(self, manual: bool):
+        if self.download_worker and self.download_worker.isRunning():
+            return
+        if self.update_worker and self.update_worker.isRunning():
+            return
+
+        self._set_update_banner("checking", f"Prüfe auf Updates (v{__version__})...")
+        self.update_worker = UpdateCheckWorker(manual=manual)
+        self.update_worker.result_ready.connect(self._on_update_check_finished)
+        self.update_worker.start()
 
     def _on_manual_update_click(self):
-        check_for_github_update(self, manual=True, status_callback=self._set_update_banner)
+        if self.latest_update_info:
+            self._prompt_and_install_update(self.latest_update_info)
+        else:
+            self._start_update_check(manual=True)
+
+    def _on_update_check_finished(self, update_info: dict | None, manual: bool):
+        self.latest_update_info = update_info
+        if update_info:
+            new_ver = update_info.get("version", "")
+            self._set_update_banner(
+                "update",
+                f"🚀 Neues Update verfügbar ({new_ver})! – Hier klicken zum Installieren",
+            )
+        else:
+            self._set_update_banner(
+                "ok",
+                f"✓ Aktuell (v{__version__}) – Klicken zum erneuten Prüfen",
+            )
+
+    def _prompt_and_install_update(self, update_info: dict):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self,
+                "Entwicklungsmodus",
+                f"Update {update_info.get('version')} gefunden!\n"
+                "Die automatische Installation funktioniert nur in der kompilierten EXE-Version.",
+            )
+            return
+
+        new_ver = update_info.get("version", "")
+        notes = update_info.get("notes", "").strip()
+        msg = f"Eine neue Version ({new_ver}) ist verfügbar (aktuell: v{__version__}).\n\n"
+        if notes:
+            msg += f"Änderungen:\n{notes[:400]}\n\n"
+        msg += "Möchtest du das Update jetzt herunterladen und installieren?"
+
+        reply = QMessageBox.question(
+            self,
+            "Update verfügbar",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._set_update_banner("update", f"⏳ Lade Update {new_ver} herunter (0%)...")
+            self.download_worker = UpdateDownloadWorker(update_info)
+            self.download_worker.progress_changed.connect(
+                lambda pct: self._set_update_banner("update", f"⏳ Lade Update {new_ver} herunter ({pct}%)...")
+            )
+            self.download_worker.failed.connect(self._on_update_download_failed)
+            self.download_worker.start()
+
+    def _on_update_download_failed(self):
+        self._set_update_banner("update", "❌ Update-Download fehlgeschlagen – Klicken zum erneuten Versuch")
+        QMessageBox.warning(
+            self,
+            "Update fehlgeschlagen",
+            "Das Update konnte nicht heruntergeladen werden. Bitte prüfe deine Internetverbindung oder den GitHub-Token.",
+        )
 
     def _on_dz_changed(self, val: float):
         self.worker.deadzone = val
@@ -871,7 +807,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.worker.stop()
-        if self.update_worker.isRunning():
+        if self.update_worker and self.update_worker.isRunning():
             self.update_worker.wait(500)
         event.accept()
 
