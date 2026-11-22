@@ -1,3 +1,5 @@
+# Out of Alpha
+
 - enhanced the detection of the Farming Sim Side Panel and Steering wheel
 - added the ability to calibrate buttons and axis, allowing you to differenciate dual axis (-1 to 1) into single axis (0 to 1), buttons to axis, axis to buttons etc.
 - added a large and community based database of various controllers
