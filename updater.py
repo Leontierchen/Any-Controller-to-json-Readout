@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import time
 import shutil
 import zipfile
 import tempfile
@@ -64,9 +63,8 @@ def check_for_updates(repo: str, current_version: str) -> dict | None:
         return None
 
     if _parse_version(latest_tag) <= _parse_version(current_version):
-        return None  # Bereits aktuell
+        return None
 
-    # Passendes Asset suchen (.exe bevorzugt, alternativ .zip für --onedir)
     assets = data.get("assets", [])
     target_asset = None
     for asset in assets:
@@ -82,7 +80,7 @@ def check_for_updates(repo: str, current_version: str) -> dict | None:
     return {
         "version": latest_tag,
         "notes": data.get("body", ""),
-        "asset_url": target_asset.get("url"),  # Wichtig: API-URL für private Repos!
+        "asset_url": target_asset.get("url"),
         "asset_name": target_asset.get("name"),
         "size": target_asset.get("size", 0),
     }
@@ -90,8 +88,8 @@ def check_for_updates(repo: str, current_version: str) -> dict | None:
 
 def download_and_install(update_info: dict, progress_callback=None) -> bool:
     """
-    Lädt das Update herunter, schreibt ein sauberes Batch-Skript zum Austausch
-    und startet die Anwendung ohne PyInstaller-Env-Leichen neu.
+    Lädt das Update herunter und führt den Austausch komplett unsichtbar
+    über VBScript + File-Lock-Prüfung durch (0 Konsolenfenster, kein Aufhängen).
     """
     if not getattr(sys, "frozen", False):
         print("[Updater] Nicht als EXE kompiliert – Update-Installation übersprungen.")
@@ -105,7 +103,7 @@ def download_and_install(update_info: dict, progress_callback=None) -> bool:
     temp_dir = tempfile.mkdtemp(prefix="app_update_")
     download_path = os.path.join(temp_dir, asset_name)
 
-    # 1. Asset über die API-URL herunterladen (funktioniert für Public & Private Repos)
+    # 1. Asset über die GitHub API-URL herunterladen
     req = urllib.request.Request(
         asset_url,
         headers=_get_headers(accept="application/octet-stream"),
@@ -129,65 +127,88 @@ def download_and_install(update_info: dict, progress_callback=None) -> bool:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return False
 
-    # 2. Entpacken falls ZIP (--onedir), sonst direkte EXE (--onefile)
+    # 2. Entpacken falls ZIP (--onedir oder ZIP-Release), sonst direkte EXE
     source_target = download_path
     is_zip = asset_name.lower().endswith(".zip")
     if is_zip:
         extract_dir = os.path.join(temp_dir, "extracted")
         with zipfile.ZipFile(download_path, "r") as zf:
             zf.extractall(extract_dir)
-        # Falls im ZIP ein einzelner Unterordner liegt, diesen als Quelle nehmen
         entries = os.listdir(extract_dir)
         if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
             source_target = os.path.join(extract_dir, entries[0])
         else:
             source_target = extract_dir
 
-    # 3. Updater-Batch erstellen (wartet auf Prozess-Ende, kopiert, startet neu)
-    bat_path = os.path.join(temp_dir, "apply_update.bat")
-    pid = os.getpid()
+    # 3. Unsichtbares VBScript zum Austausch & Neustart erzeugen
+    vbs_path = os.path.join(temp_dir, "apply_update.vbs")
+
+    def _vbs_escape(path_str: str) -> str:
+        return path_str.replace('"', '""')
+
+    exe_esc = _vbs_escape(current_exe)
+    dir_esc = _vbs_escape(app_dir)
+    src_esc = _vbs_escape(source_target)
+    tmp_esc = _vbs_escape(temp_dir)
 
     if is_zip:
-        copy_cmd = f'xcopy /E /I /Y "{source_target}\\*" "{app_dir}\\"'
+        copy_block = f'fso.CopyFolder "{src_esc}\\*", "{dir_esc}\\", True\nOn Error Resume Next\nfso.CopyFile "{src_esc}\\*", "{dir_esc}\\", True'
     else:
-        copy_cmd = f'move /Y "{source_target}" "{current_exe}"'
+        copy_block = f'fso.CopyFile "{src_esc}", "{exe_esc}", True'
 
-    bat_content = f"""@echo off
-chcp 65001 > nul
-:waitloop
-tasklist /FI "PID eq {pid}" 2>NUL | find /I /N "{pid}">NUL
-if "%ERRORLEVEL%"=="0" (
-    timeout /t 1 /nobreak > nul
-    goto waitloop
-)
+    vbs_content = f"""Option Explicit
+Dim fso, shell, env, i, locked, testFile
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
 
-timeout /t 1 /nobreak > nul
-{copy_cmd}
+' 1. Warten, bis Windows die alte EXE-Datei freigibt (max. 20 Sekunden)
+For i = 1 To 40
+    WScript.Sleep 500
+    On Error Resume Next
+    Err.Clear
+    Set testFile = fso.OpenTextFile("{exe_esc}", 8, False)
+    If Err.Number = 0 Then
+        testFile.Close
+        locked = False
+        Exit For
+    Else
+        locked = True
+    End If
+    On Error GoTo 0
+Next
 
-REM PyInstaller-Umgebungsvariablen vor dem Neustart zwingend löschen!
-set _MEIPASS=
-set _MEIPASS2=
-set _PYI_APPLICATION_HOME_DIR=
-set _PYI_PARENT_PROCESS_LEVEL=
-set _PYI_SPLASH_IPC=
+' 2. Neue Dateien kopieren / überschreiben
+On Error Resume Next
+{copy_block}
+On Error GoTo 0
 
-start "" "{current_exe}"
-rmdir /S /Q "{temp_dir}"
-exit
+' 3. PyInstaller-Umgebungsvariablen vor dem Neustart bereinigen
+Set env = shell.Environment("Process")
+env.Remove("_MEIPASS")
+env.Remove("_MEIPASS2")
+env.Remove("_PYI_APPLICATION_HOME_DIR")
+env.Remove("_PYI_PARENT_PROCESS_LEVEL")
+env.Remove("_PYI_SPLASH_IPC")
+
+' 4. Aktualisierte EXE normal starten & Temp-Ordner aufräumen
+WScript.Sleep 300
+shell.Run Chr(34) & "{exe_esc}" & Chr(34), 1, False
+WScript.Sleep 1000
+On Error Resume Next
+fso.DeleteFolder "{tmp_esc}", True
 """
 
-    with open(bat_path, "w", encoding="utf-8") as f:
-        f.write(bat_content)
+    with open(vbs_path, "w", encoding="utf-16") as f:
+        f.write(vbs_content)
 
-    # 4. Batch komplett abgekoppelt starten und aktuelle App beenden
+    # 4. Umgebung bereinigen und wscript.exe komplett fensterlos starten
     clean_env = os.environ.copy()
     for key in list(clean_env.keys()):
         if key.startswith("_PYI") or key.startswith("_MEI"):
             clean_env.pop(key, None)
 
     subprocess.Popen(
-        ["cmd.exe", "/c", bat_path],
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+        ["wscript.exe", "//B", "//Nologo", vbs_path],
         env=clean_env,
         close_fds=True,
     )
